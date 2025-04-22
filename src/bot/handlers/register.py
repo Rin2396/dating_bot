@@ -191,24 +191,7 @@ async def handle_swipe(callback: CallbackQuery, bot: Bot):
     try:
         conn = await asyncpg.connect(user="user", password="password", database="dating", host="db")
 
-        # Получаем username из БД (а не из profile)
-        to_user_data = await conn.fetchrow("SELECT username FROM profiles WHERE user_id = $1", to_user_id)
-        to_tag = f"@{to_user_data['username']}" if to_user_data and to_user_data["username"] else f"id{to_user_id}"
-        from_tag = f"@{callback.from_user.username}" if callback.from_user.username else f"id{user_id}"
-
-        # Узнаём, лайкал ли он тебя
-        existing_like = await conn.fetchrow("""
-            SELECT is_like FROM likes
-            WHERE from_user_id = $1 AND to_user_id = $2
-        """, to_user_id, user_id)
-
-        # Узнаём, лайкал ли ты уже его
-        already_swiped = await conn.fetchval("""
-            SELECT 1 FROM likes
-            WHERE from_user_id = $1 AND to_user_id = $2
-        """, user_id, to_user_id)
-
-        # Сохраняем текущий свайп
+        # Сохраняем свайп
         await conn.execute("""
             INSERT INTO likes (from_user_id, to_user_id, is_like)
             VALUES ($1, $2, $3)
@@ -216,13 +199,22 @@ async def handle_swipe(callback: CallbackQuery, bot: Bot):
             DO UPDATE SET is_like = EXCLUDED.is_like
         """, user_id, to_user_id, liked)
 
-        # 💘 Если взаимный лайк — мэтч
-        if liked and existing_like and existing_like["is_like"] is True:
+        # Узнаём, как ранее проголосовал он
+        existing_like = await conn.fetchval("""
+            SELECT is_like FROM likes
+            WHERE from_user_id = $1 AND to_user_id = $2
+        """, to_user_id, user_id)
+
+        from_tag = f"@{callback.from_user.username}" if callback.from_user.username else f"id{user_id}"
+        to_tag = f"@{profile.get('username')}" if profile.get("username") else f"id{to_user_id}"
+
+        # === 💘 Взаимный лайк ===
+        if liked and existing_like:
             await bot.send_message(user_id, f"💘 У тебя новый мэтч с {to_tag}!")
             await bot.send_message(to_user_id, f"💘 У тебя новый мэтч с {from_tag}!")
 
-        # 👁 Если тебя лайкнули первым, и ты ещё НЕ свайпал
-        elif existing_like and existing_like["is_like"] is True and not already_swiped:
+        # === 👀 Тебя лайкнули первым ===
+        elif existing_like and existing_like is True and not liked:
             await bot.send_message(user_id, f"👀 Тебя лайкнул(а) {to_tag}!")
             await bot.send_photo(
                 chat_id=user_id,
