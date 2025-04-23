@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     gender TEXT,
     description TEXT,
     preference TEXT,
-    photo_id TEXT
+    photo_id TEXT,
+    username text
 );
 
 
