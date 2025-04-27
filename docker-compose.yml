@@ -16,6 +16,10 @@ services:
   redis:
     image: redis:6
     restart: always
+    volumes:
+      - redis_data:/data # Mount the named volume to the data directory
+    ports:
+      - "6379:6379" # Expose Redis port if needed for external access/tools
 
   db:
     image: postgres
@@ -89,3 +93,5 @@ services:
 volumes:
   db_data:
   minio_data:
+  redis_data: # Define the named volume for Redis
+
