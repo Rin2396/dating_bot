@@ -72,6 +72,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - BOT_TOKEN=${BOT_TOKEN}
+      
     volumes:
       - .:/app
 
