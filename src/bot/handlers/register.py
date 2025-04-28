@@ -12,7 +12,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery
 from bot.keyboards.menu import menu_keyboard 
 from bot.states.registration import RegistrationState
-from bot.handlers import menu  # <-- Новый импорт меню
+from bot.handlers import menu
+from aiogram.types import BufferedInputFile
+from bot.utils.minio_client import upload_photo, get_photo_from_minio
 
 router = Router()
 
@@ -34,15 +36,13 @@ async def delete_profile(callback: CallbackQuery, state: FSMContext):
 async def browse_profiles(callback: CallbackQuery):
     await callback.message.answer("Продолжаем просмотр анкет. Введите /browse")
 
-# Configure logging
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Configuration ---
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq/")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
-# --- Global Async Resources ---
 rabbitmq_connection: aio_pika.Connection = None
 rabbitmq_channel: aio_pika.Channel = None
 db_pool: asyncpg.Pool = None
@@ -51,7 +51,6 @@ profile_queues: dict = {}
 
 router = Router()
 
-# --- Inline Keyboard Buttons ---
 
 def get_swipe_buttons(profile_user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -72,7 +71,6 @@ def get_filter_buttons():
          InlineKeyboardButton(text="Всех", callback_data="filter_all")]
     ])
 
-# --- Async Resource Initialization ---
 
 async def init_resources(database_url: str):
     global rabbitmq_connection, rabbitmq_channel, db_pool, redis_client, profile_queues
@@ -85,7 +83,7 @@ async def init_resources(database_url: str):
         profile_queues[name] = queue
     # Redis
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    # DB Pool
+
     db_pool = await asyncpg.create_pool(database_url)
     logger.info("Resources initialized.")
 
@@ -108,54 +106,99 @@ async def close_resources():
 def setup(dp: Dispatcher):
     dp.include_router(router)
 
-# --- Helper to get next profile from RabbitMQ and send ---
+async def get_and_send_profile(message: Message, gender_filter: str, user_city: str):
+    user_id = message.from_user.id
 
-async def get_and_send_profile(message: Message, gender_filter: str):
     if not rabbitmq_channel:
         await message.answer("❌ Внутренняя ошибка: RabbitMQ не готов.")
         return
+
+    personal_queue_name = f"user_queue_{user_id}"
+    personal_queue = await rabbitmq_channel.declare_queue(personal_queue_name, durable=True, auto_delete=False)
+    incoming_msg = await personal_queue.get(no_ack=False, fail=False)
+
+    viewed_key = f"user:{user_id}:viewed_profiles"
+
+    if incoming_msg:
+        try:
+            profile_data = json.loads(incoming_msg.body.decode('utf-8'))
+            target_user_id = profile_data["user_id"]
+
+            already_viewed = await redis_client.sismember(viewed_key, target_user_id)
+            if already_viewed:
+                await incoming_msg.reject(requeue=False)
+                await get_and_send_profile(message, gender_filter, user_city)
+                return
+
+            photo_file = await get_photo_from_minio(profile_data["photo_url"])
+            if photo_file:
+                caption = (
+                    f"<b>{profile_data['name']}, {profile_data['age']}</b>\n"
+                    f"{profile_data['city']} — {profile_data['description']}\n"
+                    f"<i>Ищет:</i> {profile_data['preference']}"
+                )
+                await message.answer_photo(
+                    photo=photo_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=get_swipe_buttons(profile_data["user_id"])
+                )
+                await redis_client.sadd(viewed_key, target_user_id)
+                await incoming_msg.ack()
+                return
+            else:
+                await incoming_msg.reject(requeue=False)
+
+        except Exception:
+            await incoming_msg.reject(requeue=False)
+
     queue_name = f'profiles_{gender_filter}'
     queue = profile_queues.get(queue_name)
     if not queue:
         queue = await rabbitmq_channel.declare_queue(queue_name, durable=True, auto_delete=False)
         profile_queues[queue_name] = queue
-    try:
+
+    while True:
         incoming_msg = await queue.get(no_ack=False, fail=False)
         if incoming_msg is None:
             await message.answer("Пока нет анкет по твоим фильтрам 😢")
             return
+
         try:
             profile_data = json.loads(incoming_msg.body.decode('utf-8'))
-            required_keys = ['user_id', 'name', 'age', 'city', 'description', 'preference', 'photo_id']
-            if not all(key in profile_data for key in required_keys):
-                await message.answer("⚠️ Получены некорректные данные профиля.")
-                await incoming_msg.reject(requeue=False)
-                await get_and_send_profile(message, gender_filter)
-                return
-            caption = (
-                f"<b>{profile_data['name']}, {profile_data['age']}</b>\n"
-                f"{profile_data['city']} — {profile_data['description']}\n"
-                f"<i>Ищет:</i> {profile_data['preference']}"
-            )
-            await message.answer_photo(
-                photo=profile_data["photo_id"],
-                caption=caption,
-                reply_markup=get_swipe_buttons(profile_data["user_id"]),
-                parse_mode="HTML"
-            )
-            await incoming_msg.ack()
-        except json.JSONDecodeError:
-            await message.answer("⚠️ Получены некорректные данные профиля.")
-            await incoming_msg.reject(requeue=False)
-            await get_and_send_profile(message, gender_filter)
-        except Exception:
-            await message.answer("⚠️ Ошибка обработки данных профиля.")
-            await incoming_msg.reject(requeue=False)
-            await get_and_send_profile(message, gender_filter)
-    except Exception as e:
-        await message.answer(f"⚠️ Ошибка получения анкет из очереди: {e}")
+            target_user_id = profile_data["user_id"]
 
-# --- Registration Handlers ---
+            already_viewed = await redis_client.sismember(viewed_key, target_user_id)
+            if already_viewed:
+                await incoming_msg.reject(requeue=False)
+                continue
+
+            if user_city.lower() != profile_data.get("city", "").lower():
+                await incoming_msg.reject(requeue=False)
+                continue
+
+            photo_file = await get_photo_from_minio(profile_data["photo_url"])
+            if photo_file:
+                caption = (
+                    f"<b>{profile_data['name']}, {profile_data['age']}</b>\n"
+                    f"{profile_data['city']} — {profile_data['description']}\n"
+                    f"<i>Ищет:</i> {profile_data['preference']}"
+                )
+                await message.answer_photo(
+                    photo=photo_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=get_swipe_buttons(profile_data["user_id"])
+                )
+                await redis_client.sadd(viewed_key, target_user_id)
+                await incoming_msg.ack()
+                return
+            else:
+                await incoming_msg.reject(requeue=False)
+
+        except Exception:
+            await incoming_msg.reject(requeue=False)
+
 
 @router.message(F.text == "/start")
 async def start_registration(message: Message, state: FSMContext):
@@ -193,10 +236,18 @@ async def get_name(message: Message, state: FSMContext):
 async def get_photo(message: Message, state: FSMContext):
     user_id = message.from_user.id
     photo: PhotoSize = message.photo[-1]
-    await state.update_data(photo_id=photo.file_id)
+    file = await message.bot.get_file(photo.file_id)
+    file_bytes = await message.bot.download_file(file.file_path)
+    photo_url = upload_photo(file_bytes.read())
+    await state.update_data(photo_url=photo_url)
     await message.answer("Сколько тебе лет?")
     await state.set_state(RegistrationState.age)
     await redis_client.hset(f"user:{user_id}", "fsm_state", RegistrationState.age.state)
+
+@router.message(RegistrationState.photo, ~F.photo)
+async def invalid_photo(message: Message):
+    await message.answer("Пожалуйста, отправь фотографию.")
+
 
 @router.message(RegistrationState.photo, ~F.photo)
 async def invalid_photo(message: Message):
@@ -241,6 +292,7 @@ async def get_preference(message: Message, state: FSMContext):
     await state.set_state(RegistrationState.gender)
     await redis_client.hset(f"user:{user_id}", "fsm_state", RegistrationState.gender.state)
 
+
 @router.callback_query(RegistrationState.gender, F.data.startswith("gender_"))
 async def get_gender(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -251,6 +303,7 @@ async def get_gender(callback: CallbackQuery, state: FSMContext):
     await redis_client.hset(f"user:{user_id}", "fsm_state", RegistrationState.gender_filter.state)
     await callback.answer()
 
+
 @router.callback_query(RegistrationState.gender_filter, F.data.startswith("filter_"))
 async def get_filter(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -258,28 +311,30 @@ async def get_filter(callback: CallbackQuery, state: FSMContext):
     await state.update_data(gender_filter=gender_filter)
     await redis_client.hset(f"user:{user_id}", "fsm_state", "registered")
     await redis_client.hset(f"user:{user_id}", "gender_filter", gender_filter)
+
     data = await state.get_data()
     conn = None
     try:
         conn = await db_pool.acquire()
         await conn.execute(
             """INSERT INTO profiles
-               (user_id, name, age, city, description, preference, photo_id, gender, gender_filter, username)
+               (user_id, name, age, city, description, preference, photo_url, gender, gender_filter, username)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
                ON CONFLICT (user_id) DO UPDATE SET
                    name=EXCLUDED.name, age=EXCLUDED.age, city=EXCLUDED.city,
                    description=EXCLUDED.description, preference=EXCLUDED.preference,
-                   photo_id=EXCLUDED.photo_id, gender=EXCLUDED.gender,
+                   photo_url=EXCLUDED.photo_url, gender=EXCLUDED.gender,
                    gender_filter=EXCLUDED.gender_filter, username=EXCLUDED.username
-            """, user_id, data["name"], data["age"], data["city"],
-            data["description"], data["preference"], data["photo_id"],
+            """,
+            user_id, data["name"], data["age"], data["city"],
+            data["description"], data["preference"], data["photo_url"],
             data["gender"], gender_filter, callback.from_user.username
         )
     finally:
         if conn:
             await db_pool.release(conn)
+    await remove_old_profiles(user_id)
 
-    # Publish profile...
     profile_msg = json.dumps({
         "user_id": user_id,
         "name": data["name"],
@@ -287,31 +342,70 @@ async def get_filter(callback: CallbackQuery, state: FSMContext):
         "city": data["city"],
         "description": data["description"],
         "preference": data["preference"],
-        "photo_id": data["photo_id"]
+        "photo_url": data["photo_url"]
     }).encode("utf-8")
-    # gender-specific
-    if data["gender"] == "male":
-        await rabbitmq_channel.default_exchange.publish(
-            aio_pika.Message(body=profile_msg), routing_key="profiles_male"
-        )
-    else:
-        await rabbitmq_channel.default_exchange.publish(
-            aio_pika.Message(body=profile_msg), routing_key="profiles_female"
-        )
-    # all
+
+    gender_routing_key = "profiles_male" if data["gender"] == "male" else "profiles_female"
     await rabbitmq_channel.default_exchange.publish(
-        aio_pika.Message(body=profile_msg), routing_key="profiles_all"
+        aio_pika.Message(body=profile_msg),
+        routing_key=gender_routing_key
     )
+    await rabbitmq_channel.default_exchange.publish(
+        aio_pika.Message(body=profile_msg),
+        routing_key="profiles_all"
+    )
+
+    await redis_client.delete(f"user:{user_id}:current_action")
 
     caption = (
         f"<b>{data['name']}, {data['age']}</b>\n"
         f"{data['city']} — {data['description']}\n"
         f"<i>Ищет:</i> {data['preference']}"
     )
-    await callback.message.answer_photo(photo=data["photo_id"], caption=caption, parse_mode="HTML")
-    await callback.message.answer("Анкета готова! Попробуй /browse 💘")
+    photo_file = await get_photo_from_minio(data["photo_url"])
+    if photo_file:
+        await callback.message.answer_photo(photo=photo_file, caption=caption, parse_mode="HTML")
+    else:
+        await callback.message.answer("Ошибка загрузки фото анкеты.", parse_mode="HTML")
+
+    await callback.message.answer("✅ Профиль обновлён!\nЧтобы увидеть актуальные анкеты, нажми /browse 💘")
     await state.clear()
     await callback.answer("Анкета сохранена!")
+
+
+async def remove_old_profiles(user_id: int):
+    queues_to_clean = ["profiles_male", "profiles_female", "profiles_all"]
+
+    for queue_name in queues_to_clean:
+        queue = profile_queues.get(queue_name)
+        if not queue:
+            queue = await rabbitmq_channel.declare_queue(queue_name, durable=True, auto_delete=False)
+            profile_queues[queue_name] = queue
+
+        new_messages = []
+
+        while True:
+            incoming_msg = await queue.get(no_ack=False, fail=False)
+            if incoming_msg is None:
+                break
+
+            try:
+                profile_data = json.loads(incoming_msg.body.decode('utf-8'))
+                if profile_data["user_id"] == user_id:
+                    await incoming_msg.reject(requeue=False)
+                    continue
+                else:
+                    new_messages.append(incoming_msg)
+            except Exception:
+                await incoming_msg.reject(requeue=False)
+
+        for msg in new_messages:
+            await rabbitmq_channel.default_exchange.publish(
+                aio_pika.Message(body=msg.body),
+                routing_key=queue_name
+            )
+            await msg.ack()
+
 
 @router.message(F.text == "/browse")
 async def browse_profiles(message: Message, state: FSMContext):
@@ -319,20 +413,56 @@ async def browse_profiles(message: Message, state: FSMContext):
     conn = None
     try:
         conn = await db_pool.acquire()
-        user_data = await conn.fetchrow("SELECT gender_filter FROM profiles WHERE user_id = $1", user_id)
+        user_data = await conn.fetchrow(
+            "SELECT gender_filter, city FROM profiles WHERE user_id = $1",
+            user_id
+        )
         if not user_data:
             await message.answer("Сначала зарегистрируйся через /start 💡")
             await state.clear()
             return
+
         gender_filter = user_data["gender_filter"]
-        await state.update_data(browse_filter=gender_filter)
+        user_city = user_data["city"]
+
+        await state.update_data(browse_filter=gender_filter, browse_city=user_city)
         await redis_client.hset(f"user:{user_id}", "current_action", f"browse_{gender_filter}")
+
     finally:
         if conn:
             await db_pool.release(conn)
 
     await message.answer("Ищем для тебя анкеты...")
-    await get_and_send_profile(message, gender_filter)
+
+    queue_name = f"user_queue_{user_id}"
+    queue = await rabbitmq_channel.declare_queue(queue_name, durable=True, auto_delete=False)
+    incoming_msg = await queue.get(no_ack=False, fail=False)
+
+    if incoming_msg:
+        try:
+            profile_data = json.loads(incoming_msg.body.decode('utf-8'))
+            photo_file = await get_photo_from_minio(profile_data["photo_url"])
+            if photo_file:
+                caption = (
+                    f"<b>{profile_data['name']}, {profile_data['age']}</b>\n"
+                    f"{profile_data['city']} — {profile_data['description']}\n"
+                    f"<i>Ищет:</i> {profile_data['preference']}"
+                )
+                await message.answer_photo(
+                    photo=photo_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=get_swipe_buttons(profile_data["user_id"])
+                )
+                await incoming_msg.ack()
+                return
+            else:
+                await incoming_msg.reject(requeue=False)
+        except Exception:
+            await incoming_msg.reject(requeue=False)
+
+    data = await state.get_data()
+    await get_and_send_profile(message, data["browse_filter"], data["browse_city"])
 
 @router.callback_query(F.data.startswith("like_") | F.data.startswith("dislike_"))
 async def handle_swipe(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -341,23 +471,64 @@ async def handle_swipe(callback: CallbackQuery, bot: Bot, state: FSMContext):
         await callback.message.edit_reply_markup(reply_markup=None)
     except:
         pass
+
     action, target_id_str = callback.data.split('_')
     to_user_id = int(target_id_str)
+
     await redis_client.hset(f"user:{user_id}", mapping={
         "last_action": action,
         "last_target": str(to_user_id)
     })
 
+    await redis_client.sadd(f"user:{user_id}:viewed_profiles", to_user_id)
+
     conn = None
     try:
         conn = await db_pool.acquire()
+
         await conn.execute(
             """INSERT INTO likes (from_user_id, to_user_id, is_like)
-               VALUES ($1,$2,$3)
-               ON CONFLICT (from_user_id,to_user_id)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (from_user_id, to_user_id)
                DO UPDATE SET is_like=EXCLUDED.is_like, created_at=NOW()
-            """, user_id, to_user_id, (action=="like")
+            """, user_id, to_user_id, (action == "like")
         )
+
+        if action == "like":
+
+            profile_from = await conn.fetchrow(
+                "SELECT user_id, name, age, city, description, preference, photo_url, gender FROM profiles WHERE user_id = $1",
+                user_id
+            )
+
+            profile_to = await conn.fetchrow(
+                "SELECT gender_filter FROM profiles WHERE user_id = $1",
+                to_user_id
+            )
+
+            if profile_from and profile_to:
+                gender_filter = profile_to["gender_filter"]
+                from_gender = profile_from["gender"]
+                if (gender_filter == "all" or
+                    (gender_filter == "male" and from_gender == "male") or
+                    (gender_filter == "female" and from_gender == "female")):
+
+                    profile_msg = json.dumps({
+                        "user_id": profile_from["user_id"],
+                        "name": profile_from["name"],
+                        "age": profile_from["age"],
+                        "city": profile_from["city"],
+                        "description": profile_from["description"],
+                        "preference": profile_from["preference"],
+                        "photo_url": profile_from["photo_url"]
+                    }).encode("utf-8")
+
+                    queue_name = f"user_queue_{to_user_id}"
+                    await rabbitmq_channel.default_exchange.publish(
+                        aio_pika.Message(body=profile_msg),
+                        routing_key=queue_name
+                    )
+
         if action == "like":
             mutual = await conn.fetchval(
                 "SELECT is_like FROM likes WHERE from_user_id=$1 AND to_user_id=$2 AND is_like=TRUE",
@@ -370,13 +541,25 @@ async def handle_swipe(callback: CallbackQuery, bot: Bot, state: FSMContext):
                 to_tag = f"@{to_rec['username']}" if to_rec and to_rec.get('username') else f'<a href="tg://user?id={to_user_id}">Пользователь {to_user_id}</a>'
                 await bot.send_message(user_id, f"💘 У тебя новый мэтч с {to_tag}! Теперь вы можете общаться.", parse_mode="HTML")
                 await bot.send_message(to_user_id, f"💘 У тебя новый мэтч с {from_tag}! Теперь вы можете общаться.", parse_mode="HTML")
+
     finally:
         if conn:
             await db_pool.release(conn)
 
     await callback.answer("Принято!")
+
     data = await state.get_data()
-    if data.get("browse_filter"):
-        await get_and_send_profile(callback.message, data["browse_filter"])
+    if data.get("browse_filter") and data.get("browse_city"):
+        await get_and_send_profile(callback.message, data["browse_filter"], data["browse_city"])
     else:
         await callback.message.answer("Произошла ошибка, попробуйте /browse снова.")
+
+
+@router.message(F.text == "/reset_browse")
+async def reset_browse(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    viewed_key = f"user:{user_id}:viewed_profiles"
+
+    await redis_client.delete(viewed_key)
+
+    await message.answer("🔄 Просмотренные анкеты сброшены!\nТеперь ты снова увидишь все доступные анкеты. Нажми /browse 💘")

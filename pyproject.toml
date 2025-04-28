@@ -21,6 +21,7 @@ aio-pika = "^9.3.0"
 pydantic = "^2.7.0"
 minio = "^7.2.5"
 python-dotenv = "^1.0.1"
+boto3 = "^1.38.3"
 
 [tool.poetry.dev-dependencies]
 black = "^24.3.0"

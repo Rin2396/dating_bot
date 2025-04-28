@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     gender TEXT,
     description TEXT,
     preference TEXT,
-    photo_id TEXT,
+    photo_url TEXT,
     username text,
     filter_age_min INTEGER,
     filter_age_max INTEGER
@@ -26,3 +26,7 @@ CREATE TABLE IF NOT EXISTS likes (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_likes_to_user_id ON likes (to_user_id);
+
+ALTER TABLE profiles
+  ADD COLUMN age_filter_from  INTEGER NOT NULL DEFAULT 18,
+  ADD COLUMN age_filter_to    INTEGER NOT NULL DEFAULT 99;

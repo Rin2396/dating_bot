@@ -3,20 +3,16 @@ import asyncio
 import logging
 import os
 import redis.asyncio as redis_asyncio
-
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
-
-# Import handlers
 from bot.handlers import register, menu
 
-# --- Configuration ---
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@db:5432/dating")
 
-# --- Setup Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -29,8 +25,8 @@ storage = RedisStorage(redis=redis_client, key_builder=DefaultKeyBuilder(with_bo
 dp = Dispatcher(storage=storage)
 
 # Include handlers
-register.setup(dp)  # Подключаем регистрацию и старт
-dp.include_router(menu.router)  # Подключаем меню отдельно
+register.setup(dp)
+dp.include_router(menu.router)
 
 # --- Main startup function ---
 async def main() -> None:
