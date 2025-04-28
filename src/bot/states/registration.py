@@ -10,3 +10,4 @@ class RegistrationState(StatesGroup):
     age_filter = State()
     gender = State()
     gender_filter = State()
+    filter_age = State()
